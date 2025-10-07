@@ -1,3 +1,7 @@
+#include <X11/X.h>
+#include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cpr/cpr.h>
 
 #include "cpr/cprtypes.h"
@@ -29,6 +33,15 @@
 
 #include <unordered_set>
 #include <vector>
+#include "json.hpp"
+
+constexpr bool save_frames_to_disk = true;
+template<typename mat>
+void save_image(std::string path, mat m) {
+    if constexpr (save_frames_to_disk) {
+        cv::imwrite(path, m);
+    }
+}
 
 static bool record_frame = false;
 const std::string base_path = "/home/gudov/src/warfeye";
@@ -41,8 +54,10 @@ struct ProcessedImgs {
 ProcessedImgs processFrame(cv::Mat &&img) {
     ProcessedImgs imgs;
     cv::Mat filtered_small;
-    cv::threshold(img, filtered_small, 128, 256, 0);
-    cv::inRange(filtered_small, cv::Scalar(224,224,224), cv::Scalar(256,256,256), filtered_small);
+    int range_small = 224; // 128
+    int threshold_small = 224; // 224
+    cv::threshold(img, filtered_small, range_small, 256, 0);
+    cv::inRange(filtered_small, cv::Scalar(threshold_small,threshold_small,threshold_small), cv::Scalar(256,256,256), filtered_small);
 
     cv::Mat filtered_big;
     cv::inRange(img, cv::Scalar(224,224,224), cv::Scalar(256,256,256), filtered_big);
@@ -51,12 +66,16 @@ ProcessedImgs processFrame(cv::Mat &&img) {
     cv::blur(filtered_big, filtered_big, cv::Size(5,5));
     cv::threshold(filtered_big, filtered_big, 32, 256, 0);
 
+    save_image("filtered_small.png", filtered_small);
+    save_image("filtered_big.png", filtered_big);
     cv::copyTo(filtered_small, imgs.masked, filtered_big);
     cv::threshold(imgs.masked, imgs.masked, 128, 256, 1);
+    save_image("masked.png", imgs.masked);
 
     // cv::blur(filtered_big, counter, cv::Size(3,3));
     // cv::threshold(counter, counter, 1, 256, 0);
     cv::threshold(filtered_big, imgs.counters, 1, 256, 0);
+    save_image("counters.png", imgs.counters);
 
     return imgs;
 }
@@ -150,12 +169,11 @@ tesseract::TessBaseAPI *initTesseract() {
     return api;
 }
 
-std::optional<std::string> recognizeCut(Cut &cut, tesseract::TessBaseAPI *api, const std::unordered_set<std::string> &filter, const std::unordered_set<std::string> &exclude) {
+std::string recognizeCut(Cut &cut, tesseract::TessBaseAPI *api) {
     api->SetImage((uchar*)cut.mat.data, cut.mat.size().width, cut.mat.size().height, cut.mat.channels(), cut.mat.step1());
     api->Recognize(0);
 
     std::string text;
-    bool filter_pass = false;
     tesseract::ResultIterator* ri = api->GetIterator();
     tesseract::PageIteratorLevel level = tesseract::RIL_WORD;
     if (ri != 0) {
@@ -165,22 +183,55 @@ std::optional<std::string> recognizeCut(Cut &cut, tesseract::TessBaseAPI *api, c
                 std::string word_str = word;
                 std::transform(word_str.begin(), word_str.end(), word_str.begin(),
                     [](unsigned char c){ return std::tolower(c); });
-                if (filter.contains(word_str)) {
-                    filter_pass = true;
+                if (!text.empty()) {
+                    text += " ";
                 }
-                if (!exclude.contains(word_str)) {
-                    if (!text.empty()) {
-                        text += " ";
-                    }
-                    text += word_str;
-                }
+                text += word_str;
             }
             delete[] word;
         } while (ri->Next(level));
     }
 
-    return filter_pass ? std::make_optional(text) : std::nullopt;
+    return text;
 }
+
+struct Orders {
+    std::vector<int> sell, buy;
+};
+
+Orders get_prices(std::string slug) {
+    cpr::Response top_orders = cpr::Get(cpr::Url(fmt::format("https://api.warframe.market/v2/orders/item/{}/top", slug)));
+    // FILE *all_items_f = fopen("item_top.json", "wb");
+    // fwrite(top_orders.text.data(), top_orders.text.size(), 1, all_items_f);
+    // fclose(all_items_f);
+
+    auto json = nlohmann::json::parse(top_orders.text);
+    Orders orders;
+
+    for (auto &sell_order : json["data"]["sell"]) {
+        orders.sell.push_back(sell_order["platinum"]);
+    }
+
+    for (auto &buy_order : json["data"]["buy"]) {
+        orders.buy.push_back(buy_order["platinum"]);
+    }
+
+    for (size_t i = orders.sell.size(); i < 5; i++) {
+        orders.sell.push_back(4096);
+    }
+    for (size_t i = orders.buy.size(); i < 5; i++) {
+        orders.buy.push_back(0);
+    }
+
+    std::sort(orders.sell.begin(), orders.sell.end(), [](int a, int b){return a > b;});
+    std::sort(orders.buy.begin(), orders.buy.end(), [](int a, int b){return a > b;});
+    return orders;
+}
+
+struct ItemInfo {
+    std::string slug;
+    bool vaulted;
+};
 
 int main(int argc, char *argv[]) {
     std::thread keyboard([](){
@@ -188,19 +239,24 @@ int main(int argc, char *argv[]) {
         Window      root    = DefaultRootWindow(dpy);
         XEvent      ev;
 
-        unsigned int    modifiers       = ControlMask | ShiftMask;
+        unsigned int    modifiers       = ControlMask | ShiftMask; // AnyModifier
         int             keycode         = XKeysymToKeycode(dpy,XK_P);
         Window          grab_window     =  root;
         Bool            owner_events    = False;
         int             pointer_mode    = GrabModeAsync;
         int             keyboard_mode   = GrabModeAsync;
 
-        XGrabKey(dpy, keycode, modifiers, grab_window, owner_events, pointer_mode,
+        int grab_result = XGrabKey(dpy, keycode, modifiers, grab_window, owner_events, pointer_mode,
                 keyboard_mode);
+
+        // unsigned int target_modifers = ControlMask | ShiftMask;
 
         XSelectInput(dpy, root, KeyPressMask );
         while(true) {
             XNextEvent(dpy, &ev);
+            // if ((ev.xkey.state & target_modifers) != target_modifers) {
+            //     continue;
+            // }
             switch(ev.type)
             {
                 case KeyPress:
@@ -225,10 +281,20 @@ int main(int argc, char *argv[]) {
     };
 
     cpr::Response all_items = cpr::Get(cpr::Url("https://api.warframe.market/v2/items"));
-    FILE *all_items_f = fopen("all_items.json", "wb");
-    fwrite(all_items.text.data(), all_items.text.size(), 1, all_items_f);
-    fclose(all_items_f);
-    exit(0);
+
+    auto items_json = nlohmann::json::parse(all_items.text);
+    auto items_data = items_json["data"];
+    std::unordered_map<std::string, ItemInfo> items_slugs;
+    for (auto item: items_data) {
+        std::string name = item["i18n"]["en"]["name"];
+        std::transform(name.begin(), name.end(), name.begin(),
+                    [](unsigned char c){ return std::tolower(c); });
+        // std::cout << "add item: " << name << std::endl;
+        items_slugs[name] = {
+            .slug = item["slug"],
+            .vaulted = item["vaulted"].is_boolean() ? (bool)item["vaulted"] : false
+        };
+    }
 
     init_screencast(argc, argv, [&](void*data,uint32_t size,size_t w,size_t h) {
         if (record_frame) {
@@ -240,10 +306,40 @@ int main(int argc, char *argv[]) {
             auto processed = processFrame(std::move(image_rgb));
             auto cuts = cutImages(processed);
 
+            size_t i = 1;
             for (auto &cut: cuts) {
-                auto text = recognizeCut(cut, tess_api, filter, exclude);
-                if (text) {
-                    std::cout << *text << std::endl;
+                auto text = recognizeCut(cut, tess_api);
+                // std::cout << fmt::format("check text {}: '{}'", i, text) << std::endl;
+                save_image(fmt::format("pics/{}.png", i++), cut.mat);
+                if (text.contains("prime")) {
+                    if (items_slugs.contains(text)) {
+                        auto &item_info = items_slugs[text];
+                        auto orders = get_prices(item_info.slug);
+                        std::cout << fmt::format("{: <40}", text);
+                        std::cout << " sell|buy: ";
+                        for (auto &v: orders.sell) {
+                            if (v == 4096 || v == 0) {
+                                std::cout << "   ";
+                            } else {
+                                std::cout << fmt::format("{: >3}", v);
+                            }
+                        }
+                        std::cout << " | ";
+                        for (auto &v: orders.buy) {
+                            if (v == 4096 || v == 0) {
+                                std::cout << "   ";
+                            } else {
+                                std::cout << fmt::format("{: >3}", v);
+                            }
+                        }
+                        if (item_info.vaulted) {
+                            std::cout << " VAULTED";
+                        }
+                        std::cout << std::endl;
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    } else {
+                        std::cout << fmt::format("cant find item in cache '{}'", text) << std::endl;
+                    }
                 }
             }
         }
