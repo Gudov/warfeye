@@ -31,9 +31,37 @@
 #include <X11/Xutil.h>
 #include <fmt/format.h>
 
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include "json.hpp"
+
+struct Config {
+    bool display_orders = true;
+    bool display_ducats = false;
+    float text_box_bonus_mult = 1;
+};
+
+Config config;
+void ReloadConfig() {
+    // if (!std::filesystem::exists("config.json")) {
+    //     nlohmann::json def;
+    //     def["display_orders"] = true;
+    //     def["display_ducats"] = false;
+    //     def["text_box_bonus_mult"] = 1.f;
+    //     std::ofstream file("config.txt");
+    //     file << def.dump();
+    //     file.flush();
+    // }
+
+    std::ifstream file("config.txt");
+    std::ostringstream sstr;
+    sstr << file.rdbuf();
+    nlohmann::json config_ = nlohmann::json::parse(sstr.str());
+    config.display_orders = config_["display_orders"];
+    config.display_ducats = config_["display_ducats"];
+    config.text_box_bonus_mult = config_["text_box_bonus_mult"];
+}
 
 constexpr bool save_frames_to_disk = true;
 template<typename mat>
@@ -96,7 +124,7 @@ std::vector<Cut> cutImages(ProcessedImgs &imgs) {
         approxPolyDP( contours[i], contours_poly[i], 3, true );
         boundRect[i] = boundingRect( contours_poly[i] );
         int max_w = imgs.counters.cols;
-        boundRect[i].width = std::min(boundRect[i].width + boundRect[i].height, max_w);
+        boundRect[i].width = std::min(boundRect[i].width + int(boundRect[i].height * config.text_box_bonus_mult), max_w);
         int max_h = imgs.counters.rows;
         boundRect[i].height = std::min(int(boundRect[i].height * 1.2f), max_w);
     }
@@ -147,10 +175,13 @@ std::vector<Cut> cutImages(ProcessedImgs &imgs) {
 
     auto it = merged.begin();
     for( size_t i = 0; i < merged.size(); i++ ) {
+        it->width = std::min(it->width, imgs.masked.cols - it->x - 1);
+        it->height = std::min(it->height, imgs.masked.rows - it->y - 1);
         cuts.push_back({
             .pos = *it,
             .mat = imgs.masked(*it).clone()
         });
+        save_image(fmt::format("pics/{}.png", i), cuts.back().mat);
         it++;
     }
 
@@ -165,6 +196,19 @@ tesseract::TessBaseAPI *initTesseract() {
     }
 
     api->SetPageSegMode(tesseract::PSM_SINGLE_BLOCK);
+    static std::string allowed;
+    auto add_range = [&](char begin, char end) {
+        while (begin <= end) {
+            allowed += begin;
+            begin++;
+        }
+    };
+    add_range('A', 'Z');
+    add_range('a', 'z');
+    add_range('0', '9');
+    allowed += ' ';
+    allowed += '&';
+    api->SetVariable("tessedit_char_whitelist", allowed.c_str());
 
     return api;
 }
@@ -183,10 +227,12 @@ std::string recognizeCut(Cut &cut, tesseract::TessBaseAPI *api) {
                 std::string word_str = word;
                 std::transform(word_str.begin(), word_str.end(), word_str.begin(),
                     [](unsigned char c){ return std::tolower(c); });
-                if (!text.empty()) {
-                    text += " ";
+                if (text != "jy") {
+                    if (!text.empty()) {
+                        text += " ";
+                    }
+                    text += word_str;
                 }
-                text += word_str;
             }
             delete[] word;
         } while (ri->Next(level));
@@ -201,9 +247,6 @@ struct Orders {
 
 Orders get_prices(std::string slug) {
     cpr::Response top_orders = cpr::Get(cpr::Url(fmt::format("https://api.warframe.market/v2/orders/item/{}/top", slug)));
-    // FILE *all_items_f = fopen("item_top.json", "wb");
-    // fwrite(top_orders.text.data(), top_orders.text.size(), 1, all_items_f);
-    // fclose(all_items_f);
 
     auto json = nlohmann::json::parse(top_orders.text);
     Orders orders;
@@ -231,9 +274,11 @@ Orders get_prices(std::string slug) {
 struct ItemInfo {
     std::string slug;
     bool vaulted;
+    std::optional<int> ducats;
 };
 
 int main(int argc, char *argv[]) {
+    ReloadConfig();
     std::thread keyboard([](){
         Display*    dpy     = XOpenDisplay(0);
         Window      root    = DefaultRootWindow(dpy);
@@ -289,15 +334,16 @@ int main(int argc, char *argv[]) {
         std::string name = item["i18n"]["en"]["name"];
         std::transform(name.begin(), name.end(), name.begin(),
                     [](unsigned char c){ return std::tolower(c); });
-        // std::cout << "add item: " << name << std::endl;
         items_slugs[name] = {
             .slug = item["slug"],
-            .vaulted = item["vaulted"].is_boolean() ? (bool)item["vaulted"] : false
+            .vaulted = item["vaulted"].is_boolean() ? (bool)item["vaulted"] : false,
+            .ducats = item["ducats"].is_number() ? std::make_optional(int(item["ducats"])) : std::nullopt
         };
     }
 
     init_screencast(argc, argv, [&](void*data,uint32_t size,size_t w,size_t h) {
         if (record_frame) {
+            ReloadConfig();
             record_frame = false;
             std::cout << "image recieved" << std::endl;
             cv::Mat image(h,w, CV_8UC4, (uint8_t*)data);
@@ -306,41 +352,61 @@ int main(int argc, char *argv[]) {
             auto processed = processFrame(std::move(image_rgb));
             auto cuts = cutImages(processed);
 
-            size_t i = 1;
+            int total_plt = 0;
+            int total_ducats = 0;
+            std::unordered_map<int, int> ducats_plt = {
+                {15, 1},
+                {25, 1},
+                {45, 2},
+                {65, 3},
+                {100, 7}
+            };
             for (auto &cut: cuts) {
                 auto text = recognizeCut(cut, tess_api);
-                // std::cout << fmt::format("check text {}: '{}'", i, text) << std::endl;
-                save_image(fmt::format("pics/{}.png", i++), cut.mat);
                 if (text.contains("prime")) {
                     if (items_slugs.contains(text)) {
                         auto &item_info = items_slugs[text];
-                        auto orders = get_prices(item_info.slug);
                         std::cout << fmt::format("{: <40}", text);
-                        std::cout << " sell|buy: ";
-                        for (auto &v: orders.sell) {
-                            if (v == 4096 || v == 0) {
-                                std::cout << "   ";
-                            } else {
-                                std::cout << fmt::format("{: >3}", v);
+
+                        if (config.display_orders) {
+                            auto orders = get_prices(item_info.slug);
+                            std::this_thread::sleep_for(std::chrono::seconds(1));
+                            std::cout << " sell|buy: ";
+                            for (auto &v: orders.sell) {
+                                if (v == 4096 || v == 0) {
+                                    std::cout << "   ";
+                                } else {
+                                    std::cout << fmt::format("{: >3}", v);
+                                }
+                            }
+                            std::cout << " | ";
+                            for (auto &v: orders.buy) {
+                                if (v == 4096 || v == 0) {
+                                    std::cout << "   ";
+                                } else {
+                                    std::cout << fmt::format("{: >3}", v);
+                                }
                             }
                         }
-                        std::cout << " | ";
-                        for (auto &v: orders.buy) {
-                            if (v == 4096 || v == 0) {
-                                std::cout << "   ";
-                            } else {
-                                std::cout << fmt::format("{: >3}", v);
-                            }
+                        if (config.display_ducats && item_info.ducats) {
+                            int item_ducats = *item_info.ducats;
+                            std::cout << fmt::format("{: >4}", item_ducats);
+                            int item_ducat_plt = ducats_plt[item_ducats];
+                            std::cout << fmt::format("{: >3}", item_ducat_plt);
+                            total_ducats += item_ducats;
+                            total_plt += item_ducat_plt;
                         }
                         if (item_info.vaulted) {
                             std::cout << " VAULTED";
                         }
                         std::cout << std::endl;
-                        std::this_thread::sleep_for(std::chrono::seconds(1));
                     } else {
                         std::cout << fmt::format("cant find item in cache '{}'", text) << std::endl;
                     }
                 }
+            }
+            if (total_plt != 0) {
+                std::cout << fmt::format("plt for ducats: {}, ducats: {}", total_plt, total_ducats) << std::endl;
             }
         }
     });
