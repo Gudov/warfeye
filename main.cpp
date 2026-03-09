@@ -46,16 +46,6 @@ struct Config {
 
 Config config;
 void ReloadConfig() {
-    // if (!std::filesystem::exists("config.json")) {
-    //     nlohmann::json def;
-    //     def["display_orders"] = true;
-    //     def["display_ducats"] = false;
-    //     def["text_box_bonus_mult"] = 1.f;
-    //     std::ofstream file("config.txt");
-    //     file << def.dump();
-    //     file.flush();
-    // }
-
     std::ifstream file("config.json");
     std::ostringstream sstr;
     sstr << file.rdbuf();
@@ -81,6 +71,39 @@ struct ProcessedImgs {
     cv::Mat counters;
     cv::Mat masked;
 };
+
+std::vector<cv::Mat> bad_signs;
+void remove_bad_signs(cv::Mat &mat) {
+    if (bad_signs.empty()) {
+        std::vector<std::string> files = {"bad_signs/ok.png", "bad_signs/reserach.png", "bad_signs/archwing.png"};
+        for (auto &path : files) {
+            bad_signs.push_back(cv::imread(path, cv::IMREAD_GRAYSCALE));
+        }
+    }
+
+    for (const auto &sign : bad_signs) {
+        int res_x = mat.rows - sign.rows + 1;
+        int res_y = mat.cols - sign.cols + 1;
+        if (res_x <= 0 || res_y <= 0) {
+            continue;
+        }
+        cv::Mat res_32f(mat.rows - sign.rows + 1, mat.cols - sign.cols + 1, CV_32FC1);
+        cv::matchTemplate(mat, sign, res_32f, cv::TM_CCOEFF_NORMED);
+        cv::Mat res;
+        res_32f.convertTo(res, CV_8U, 255.0);
+        
+        int size = ((sign.cols + sign.rows) / 4) * 2 + 1; //force size to be odd
+        adaptiveThreshold(res, res, 255, cv::ADAPTIVE_THRESH_MEAN_C, cv::THRESH_BINARY, size, -128);
+
+        double minval, maxval, threshold = 0.8;
+        cv::Point minloc, maxloc;
+        cv::minMaxLoc(res, &minval, &maxval, &minloc, &maxloc);
+        if (maxval > 240) {
+            cv::Point ll{maxloc.x + sign.cols, maxloc.y + sign.rows};
+            cv::rectangle(mat, ll, maxloc, cv::Scalar(255,255,255), cv::LineTypes::FILLED);
+        }
+    }
+}
 
 ProcessedImgs processFrame(cv::Mat &&img) {
     ProcessedImgs imgs;
@@ -180,11 +203,14 @@ std::vector<Cut> cutImages(ProcessedImgs &imgs) {
     for( size_t i = 0; i < merged.size(); i++ ) {
         it->width = std::min(it->width, imgs.masked.cols - it->x - 1);
         it->height = std::min(it->height, imgs.masked.rows - it->y - 1);
+        cv::Mat sub_mat = imgs.masked(*it).clone();
+        save_image(fmt::format("pics/{}.png", i), sub_mat);
+        remove_bad_signs(sub_mat);
         cuts.push_back({
             .pos = *it,
-            .mat = imgs.masked(*it).clone()
+            .mat = sub_mat
         });
-        save_image(fmt::format("pics/{}.png", i), cuts.back().mat);
+        save_image(fmt::format("pics/{}.png", i), sub_mat);
         it++;
     }
 
@@ -382,7 +408,6 @@ int main(int argc, char *argv[]) {
     for (auto item: items_data) {
         std::string name = item["i18n"][config.ru ? "ru" : "en"]["name"];
         name = tolower_utf(name);
-        // std::cout << name << std::endl;
         items_slugs[name] = {
             .slug = item["slug"],
             .vaulted = item["vaulted"].is_boolean() ? (bool)item["vaulted"] : false,
@@ -392,7 +417,6 @@ int main(int argc, char *argv[]) {
             std::string old_name = name;
             size_t pos = name.find(" чертеж");
             name = std::string("чертеж ") + name.substr(0, pos);
-            // std::cout << name << std::endl;
             items_slugs[name] = items_slugs[old_name];
         }
     }
@@ -421,7 +445,6 @@ int main(int argc, char *argv[]) {
             for (auto &cut: cuts) {
                 auto text_u8 = recognizeCut(cut, tess_api);
                 std::string text{text_u8.begin(), text_u8.end()};
-                std::cout << text << std::endl;
                 if (text.contains("prime") || text.contains("прайм")) {
                     if (items_slugs.contains(text)) {
                         auto &item_info = items_slugs[text];
