@@ -35,10 +35,12 @@
 #include <unordered_set>
 #include <vector>
 #include "json.hpp"
+#include "utf8.h"
 
 struct Config {
     bool display_orders = true;
     bool display_ducats = false;
+    bool ru = false;
     float text_box_bonus_mult = 1;
 };
 
@@ -54,13 +56,14 @@ void ReloadConfig() {
     //     file.flush();
     // }
 
-    std::ifstream file("config.txt");
+    std::ifstream file("config.json");
     std::ostringstream sstr;
     sstr << file.rdbuf();
     nlohmann::json config_ = nlohmann::json::parse(sstr.str());
     config.display_orders = config_["display_orders"];
     config.display_ducats = config_["display_ducats"];
     config.text_box_bonus_mult = config_["text_box_bonus_mult"];
+    config.ru = config_["ru"];
 }
 
 constexpr bool save_frames_to_disk = true;
@@ -71,7 +74,7 @@ void save_image(std::string path, mat m) {
     }
 }
 
-static bool record_frame = false;
+static bool record_frame = true;
 const std::string base_path = "/home/gudov/src/warfeye";
 
 struct ProcessedImgs {
@@ -190,7 +193,8 @@ std::vector<Cut> cutImages(ProcessedImgs &imgs) {
 
 tesseract::TessBaseAPI *initTesseract() {
     tesseract::TessBaseAPI *api = new tesseract::TessBaseAPI();
-    if (api->Init("/usr/share/tessdata/", "eng", tesseract::OEM_LSTM_ONLY)) {
+    const std::string lang = config.ru ? "rus" : "eng";
+    if (api->Init("/usr/share/tessdata/", lang.c_str(), tesseract::OEM_LSTM_ONLY)) {
         fprintf(stderr, "Could not initialize tesseract.\n");
         exit(1);
     }
@@ -203,8 +207,13 @@ tesseract::TessBaseAPI *initTesseract() {
             begin++;
         }
     };
-    add_range('A', 'Z');
-    add_range('a', 'z');
+    if (config.ru) {
+        allowed += "ёйцукенгшщзхъфывапролджэячсмитьбю";
+        allowed += "ЁЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ";
+    } else {
+        add_range('A', 'Z');
+        add_range('a', 'z');
+    }
     add_range('0', '9');
     allowed += ' ';
     allowed += '&';
@@ -213,11 +222,44 @@ tesseract::TessBaseAPI *initTesseract() {
     return api;
 }
 
-std::string recognizeCut(Cut &cut, tesseract::TessBaseAPI *api) {
+std::unordered_map<uint32_t, uint32_t> lower_cache;
+uint32_t tolower_m(uint32_t ch) {
+    if (lower_cache.empty()) {
+        std::u8string lower = u8"еейцукенгшщзхъфывапролджэячсмитьбюqwertyuiopasdfghjklzxcvbnm";
+        std::u8string upper = u8"ЁёЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮQWERTYUIOPASDFGHJKLZXCVBNM";
+        std::u32string lower_u32;
+        std::u32string upper_u32;
+        utf8::utf8to32(lower.begin(), lower.end(), std::back_inserter(lower_u32));
+        utf8::utf8to32(upper.begin(), upper.end(), std::back_inserter(upper_u32));
+        for (size_t i = 0; i < lower.size(); i++) {
+            lower_cache[upper_u32[i]] = lower_u32[i];
+        }
+    }
+    auto it = lower_cache.find(ch);
+    return (it != lower_cache.end()) ? it->second : ch;
+}
+
+std::set<uint32_t> chars_blacklist{':', '(', ')'};
+std::string tolower_utf(std::string str) {
+    std::u8string word_u8{str.begin(), str.end()};
+    std::u32string word_u32;
+    utf8::utf8to32(word_u8.begin(), word_u8.end(), std::back_inserter(word_u32));
+    std::u32string lower_u32;
+    for (auto &ch : word_u32) {
+        if (!chars_blacklist.contains(ch)) {
+            lower_u32.push_back(tolower_m(ch));
+        }
+    }
+    word_u8.clear();
+    utf8::utf32to8(lower_u32.begin(), lower_u32.end(), std::back_inserter(word_u8));
+    return std::string{word_u8.begin(), word_u8.end()};
+}
+
+std::u8string recognizeCut(Cut &cut, tesseract::TessBaseAPI *api) {
     api->SetImage((uchar*)cut.mat.data, cut.mat.size().width, cut.mat.size().height, cut.mat.channels(), cut.mat.step1());
     api->Recognize(0);
 
-    std::string text;
+    std::u8string text;
     tesseract::ResultIterator* ri = api->GetIterator();
     tesseract::PageIteratorLevel level = tesseract::RIL_WORD;
     if (ri != 0) {
@@ -225,13 +267,19 @@ std::string recognizeCut(Cut &cut, tesseract::TessBaseAPI *api) {
             const char* word = ri->GetUTF8Text(level);
             if (word) {
                 std::string word_str = word;
-                std::transform(word_str.begin(), word_str.end(), word_str.begin(),
-                    [](unsigned char c){ return std::tolower(c); });
-                if (text != "jy") {
+                std::u8string word_u8{word_str.begin(), word_str.end()};
+                std::u32string word_u32;
+                utf8::utf8to32(word_u8.begin(), word_u8.end(), std::back_inserter(word_u32));
+                for (auto &ch : word_u32) {
+                    ch = tolower_m(ch);
+                }
+                word_u8.clear();
+                utf8::utf32to8(word_u32.begin(), word_u32.end(), std::back_inserter(word_u8));
+                if (text != u8"jy") {
                     if (!text.empty()) {
-                        text += " ";
+                        text += u8" ";
                     }
-                    text += word_str;
+                    text += word_u8;
                 }
             }
             delete[] word;
@@ -266,7 +314,7 @@ Orders get_prices(std::string slug) {
         orders.buy.push_back(0);
     }
 
-    std::sort(orders.sell.begin(), orders.sell.end(), [](int a, int b){return a > b;});
+    std::sort(orders.sell.begin(), orders.sell.end(), [](int a, int b){return a < b;});
     std::sort(orders.buy.begin(), orders.buy.end(), [](int a, int b){return a > b;});
     return orders;
 }
@@ -317,7 +365,8 @@ int main(int argc, char *argv[]) {
     auto tess_api = initTesseract();
     std::unordered_set<std::string> filter = {
         "prime",
-        "relic"
+        "relic",
+        "прайм"
     };
 
     std::unordered_set<std::string> exclude = {
@@ -325,20 +374,27 @@ int main(int argc, char *argv[]) {
         "[flawless]"
     };
 
-    cpr::Response all_items = cpr::Get(cpr::Url("https://api.warframe.market/v2/items"));
+    cpr::Response all_items = cpr::Get(cpr::Url("https://api.warframe.market/v2/items"), cpr::Header{{"Language", "ru"}});
 
     auto items_json = nlohmann::json::parse(all_items.text);
     auto items_data = items_json["data"];
     std::unordered_map<std::string, ItemInfo> items_slugs;
     for (auto item: items_data) {
-        std::string name = item["i18n"]["en"]["name"];
-        std::transform(name.begin(), name.end(), name.begin(),
-                    [](unsigned char c){ return std::tolower(c); });
+        std::string name = item["i18n"][config.ru ? "ru" : "en"]["name"];
+        name = tolower_utf(name);
+        // std::cout << name << std::endl;
         items_slugs[name] = {
             .slug = item["slug"],
             .vaulted = item["vaulted"].is_boolean() ? (bool)item["vaulted"] : false,
             .ducats = item["ducats"].is_number() ? std::make_optional(int(item["ducats"])) : std::nullopt
         };
+        if (name.ends_with(" чертеж")) {
+            std::string old_name = name;
+            size_t pos = name.find(" чертеж");
+            name = std::string("чертеж ") + name.substr(0, pos);
+            // std::cout << name << std::endl;
+            items_slugs[name] = items_slugs[old_name];
+        }
     }
 
     init_screencast(argc, argv, [&](void*data,uint32_t size,size_t w,size_t h) {
@@ -361,9 +417,12 @@ int main(int argc, char *argv[]) {
                 {65, 3},
                 {100, 7}
             };
+
             for (auto &cut: cuts) {
-                auto text = recognizeCut(cut, tess_api);
-                if (text.contains("prime")) {
+                auto text_u8 = recognizeCut(cut, tess_api);
+                std::string text{text_u8.begin(), text_u8.end()};
+                std::cout << text << std::endl;
+                if (text.contains("prime") || text.contains("прайм")) {
                     if (items_slugs.contains(text)) {
                         auto &item_info = items_slugs[text];
                         std::cout << fmt::format("{: <40}", text);
