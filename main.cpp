@@ -37,11 +37,20 @@
 #include "json.hpp"
 #include "utf8.h"
 
+struct ProcessorConfig {
+    int range_small = 224;
+    int threshold_small = 224;
+};
+
 struct Config {
     bool display_orders = true;
     bool display_ducats = false;
     bool ru = false;
     float text_box_bonus_mult = 1;
+    bool count = true;
+    int count_size = 170;
+
+    ProcessorConfig processor;
 };
 
 Config config;
@@ -54,6 +63,11 @@ void ReloadConfig() {
     config.display_ducats = config_["display_ducats"];
     config.text_box_bonus_mult = config_["text_box_bonus_mult"];
     config.ru = config_["ru"];
+    config.count = config_["count"];
+    config.count_size = config_["count_size"];
+
+    config.processor.range_small = config_["processor"]["range_small"];
+    config.processor.threshold_small = config_["processor"]["threshold_small"];
 }
 
 constexpr bool save_frames_to_disk = true;
@@ -105,16 +119,17 @@ void remove_bad_signs(cv::Mat &mat) {
     }
 }
 
-ProcessedImgs processFrame(cv::Mat &&img) {
+ProcessedImgs processFrame(cv::Mat &&img, ProcessorConfig pr_config) {
     ProcessedImgs imgs;
     cv::Mat filtered_small;
-    int range_small = 224; // 128
-    int threshold_small = 224; // 224
-    cv::threshold(img, filtered_small, range_small, 256, 0);
-    cv::inRange(filtered_small, cv::Scalar(threshold_small,threshold_small,threshold_small), cv::Scalar(256,256,256), filtered_small);
+
+    cv::Scalar threshold_small(pr_config.threshold_small, pr_config.threshold_small, pr_config.threshold_small);
+
+    cv::threshold(img, filtered_small, pr_config.range_small, 256, 0);
+    cv::inRange(filtered_small, threshold_small, cv::Scalar(256,256,256), filtered_small);
 
     cv::Mat filtered_big;
-    cv::inRange(img, cv::Scalar(224,224,224), cv::Scalar(256,256,256), filtered_big);
+    cv::inRange(img, threshold_small, cv::Scalar(256,256,256), filtered_big);
     cv::blur(filtered_big, filtered_big, cv::Size(3,3));
     cv::threshold(filtered_big, filtered_big, 48, 256, 0);
     cv::blur(filtered_big, filtered_big, cv::Size(5,5));
@@ -137,6 +152,7 @@ ProcessedImgs processFrame(cv::Mat &&img) {
 struct Cut {
     cv::Rect pos;
     cv::Mat mat;
+    std::string text;
 };
 
 std::vector<Cut> cutImages(ProcessedImgs &imgs) {
@@ -219,8 +235,9 @@ std::vector<Cut> cutImages(ProcessedImgs &imgs) {
 
 tesseract::TessBaseAPI *initTesseract() {
     tesseract::TessBaseAPI *api = new tesseract::TessBaseAPI();
-    const std::string lang = config.ru ? "rus" : "eng";
+    const std::string lang = config.ru ? "rus" : "eng_best";
     if (api->Init("/usr/share/tessdata/", lang.c_str(), tesseract::OEM_LSTM_ONLY)) {
+    // if (api->Init("/home/gudov/src/tesstrain/data", "wfeng", tesseract::OEM_LSTM_ONLY)) {
         fprintf(stderr, "Could not initialize tesseract.\n");
         exit(1);
     }
@@ -315,6 +332,28 @@ std::u8string recognizeCut(Cut &cut, tesseract::TessBaseAPI *api) {
     return text;
 }
 
+std::optional<int> ParseNum(const std::string &str) {
+    for (auto &ch : str) {
+        if (ch < '0' || ch > '9') {
+            return std::nullopt;
+        }
+    }
+
+    int num;
+    try {
+        num = std::stoi(str);
+    } catch (const std::exception& e) {
+        return std::nullopt;
+    }
+    return num;
+}
+
+struct NumbersInfo {
+    int num;
+    cv::Point pos;
+};
+
+
 struct Orders {
     std::vector<int> sell, buy;
 };
@@ -352,6 +391,53 @@ struct ItemInfo {
 };
 
 int main(int argc, char *argv[]) {
+    // {
+    //     ReloadConfig();
+        
+    //     auto tess_api = initTesseract();
+
+    //     const std::string base_path = "/home/gudov/src/tesstrain/generator/data";
+    //     for (int i = 0; i < 2000; i++) {
+    //         std::string path = fmt::format("{}/{}", base_path, i);
+    //         Cut cut{.mat=cv::imread(path + ".png", cv::IMREAD_GRAYSCALE)};
+    //         auto text_u8 = recognizeCut(cut, tess_api);
+    //         cut.text = tolower_utf(std::string{text_u8.begin(), text_u8.end()});
+
+    //         std::ifstream file(path + ".gt.txt");
+    //         std::ostringstream sstr;
+    //         sstr << file.rdbuf();
+    //         std::string text = tolower_utf(sstr.str());
+
+    //         if (cut.text != text) {
+    //             std::cout << fmt::format("{}) gt: {} img: {}", i, text, cut.text) << std::endl;
+    //         }
+    //     }
+
+    //     exit(0);
+    // }
+    // {
+    //     ReloadConfig();
+        
+    //     auto tess_api = initTesseract();
+
+    //     cv::Mat akholto = cv::imread("akholto.png");
+    //     // cv::Mat i2663 = cv::imread("2663.png", cv::IMREAD_GRAYSCALE);
+    //     auto processed = processFrame(std::move(akholto), config.processor);
+    //     auto cuts = cutImages(processed);
+    //     for (auto &cut : cuts) {
+    //         auto text_u8 = recognizeCut(cut, tess_api);
+    //         cut.text = std::string{text_u8.begin(), text_u8.end()};
+    //         std::cout << cut.text << std::endl;
+    //     }
+
+    //     // Cut cut{.mat=i2663};
+    //     // auto text_u8 = recognizeCut(cut, tess_api);
+    //     // cut.text = std::string{text_u8.begin(), text_u8.end()};
+    //     // std::cout << cut.text << std::endl;
+
+    //     exit(0);
+    // }
+
     ReloadConfig();
     std::thread keyboard([](){
         Display*    dpy     = XOpenDisplay(0);
@@ -429,7 +515,7 @@ int main(int argc, char *argv[]) {
             cv::Mat image(h,w, CV_8UC4, (uint8_t*)data);
             cv::Mat image_rgb;
             cv::cvtColor(image, image_rgb, cv::COLOR_RGBA2RGB);
-            auto processed = processFrame(std::move(image_rgb));
+            auto processed = processFrame(std::move(image_rgb), config.processor);
             auto cuts = cutImages(processed);
 
             int total_plt = 0;
@@ -442,11 +528,48 @@ int main(int argc, char *argv[]) {
                 {100, 7}
             };
 
+            std::vector<NumbersInfo> numbers;
             for (auto &cut: cuts) {
                 auto text_u8 = recognizeCut(cut, tess_api);
-                std::string text{text_u8.begin(), text_u8.end()};
+                cut.text = std::string{text_u8.begin(), text_u8.end()};
+                auto num = ParseNum(cut.text);
+                if (num) {
+                    numbers.push_back(NumbersInfo{
+                        .num = *num,
+                        .pos = cut.pos.br()
+                    });
+                }
+            }
+            
+            for (auto &cut: cuts) {
+                auto &text = cut.text;
                 if (text.contains("prime") || text.contains("прайм")) {
                     if (items_slugs.contains(text)) {
+                        if (config.count) {
+                            double l_dist = 0;
+                            int number;
+                            for (auto &num: numbers) {
+                                if (num.pos.y < cut.pos.y) {
+                                    double dist = cv::norm(num.pos - cut.pos.tl());
+                                    if (l_dist == 0) {
+                                        l_dist = dist;
+                                        number = num.num;
+                                    } else if (dist < l_dist) {
+                                        l_dist = dist;
+                                        number = num.num;
+                                    }
+                                }
+                            }
+
+                            if (l_dist >= config.count_size) {
+                                number = 1;
+                            }
+
+                            std::cout << text << " count: " << number << " dist: " << l_dist << std::endl;
+
+                            continue;
+                        }
+
                         auto &item_info = items_slugs[text];
                         std::cout << fmt::format("{: <40}", text);
 
