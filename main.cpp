@@ -1,3 +1,5 @@
+#include <rapidfuzz/fuzz.hpp>
+
 #include <X11/X.h>
 #include <algorithm>
 #include <cctype>
@@ -49,6 +51,8 @@ struct Config {
     float text_box_bonus_mult = 1;
     bool count = true;
     int count_size = 170;
+    bool log_replace = false;
+    double replace_score = 90;
 
     ProcessorConfig processor;
 };
@@ -65,6 +69,8 @@ void ReloadConfig() {
     config.ru = config_["ru"];
     config.count = config_["count"];
     config.count_size = config_["count_size"];
+    config.log_replace = config_["log_replace"];
+    config.replace_score = config_["replace_score"];
 
     config.processor.range_small = config_["processor"]["range_small"];
     config.processor.threshold_small = config_["processor"]["threshold_small"];
@@ -76,6 +82,18 @@ void save_image(std::string path, mat m) {
     if constexpr (save_frames_to_disk) {
         cv::imwrite(path, m);
     }
+}
+
+std::vector<std::string> splitBySpace(const std::string& input) {
+    std::istringstream buffer(input);
+    std::vector<std::string> words;
+
+    std::string temp_word;
+    while (buffer >> temp_word) {
+        words.push_back(temp_word);
+    }
+    
+    return words;
 }
 
 static bool record_frame = true;
@@ -141,8 +159,6 @@ ProcessedImgs processFrame(cv::Mat &&img, ProcessorConfig pr_config) {
     cv::threshold(imgs.masked, imgs.masked, 128, 256, 1);
     save_image("masked.png", imgs.masked);
 
-    // cv::blur(filtered_big, counter, cv::Size(3,3));
-    // cv::threshold(counter, counter, 1, 256, 0);
     cv::threshold(filtered_big, imgs.counters, 1, 256, 0);
     save_image("counters.png", imgs.counters);
 
@@ -298,6 +314,23 @@ std::string tolower_utf(std::string str) {
     return std::string{word_u8.begin(), word_u8.end()};
 }
 
+std::optional<int> ParseNum(const std::string &str) {
+    for (auto &ch : str) {
+        if (ch < '0' || ch > '9') {
+            return std::nullopt;
+        }
+    }
+
+    int num;
+    try {
+        num = std::stoi(str);
+    } catch (const std::exception& e) {
+        return std::nullopt;
+    }
+    return num;
+}
+
+std::unordered_set<std::string> possible_words;
 std::u8string recognizeCut(Cut &cut, tesseract::TessBaseAPI *api) {
     api->SetImage((uchar*)cut.mat.data, cut.mat.size().width, cut.mat.size().height, cut.mat.channels(), cut.mat.step1());
     api->Recognize(0);
@@ -318,6 +351,25 @@ std::u8string recognizeCut(Cut &cut, tesseract::TessBaseAPI *api) {
                 }
                 word_u8.clear();
                 utf8::utf32to8(word_u32.begin(), word_u32.end(), std::back_inserter(word_u8));
+                if (!ParseNum(word) && !possible_words.contains(std::string{word_u8.begin(), word_u8.end()})) {
+                    double best_score = 0;
+                    std::string best_choise;
+                    for (auto &known: possible_words) {
+                        double score = rapidfuzz::fuzz::ratio(word_u8, std::u8string{known.begin(), known.end()});
+
+                        if (best_score <= score) {
+                            best_choise = known;
+                            best_score = score;
+                        }
+                    }
+
+                    if (best_score >= config.replace_score) {
+                        if (config.log_replace) {
+                            std::cout << "replace: " << std::string{word_u8.begin(), word_u8.end()} << " with: " << best_choise << " score: " << best_score << std::endl;
+                        }
+                        word_u8 = std::u8string{best_choise.begin(), best_choise.end()};
+                    }
+                }
                 if (text != u8"jy") {
                     if (!text.empty()) {
                         text += u8" ";
@@ -330,22 +382,6 @@ std::u8string recognizeCut(Cut &cut, tesseract::TessBaseAPI *api) {
     }
 
     return text;
-}
-
-std::optional<int> ParseNum(const std::string &str) {
-    for (auto &ch : str) {
-        if (ch < '0' || ch > '9') {
-            return std::nullopt;
-        }
-    }
-
-    int num;
-    try {
-        num = std::stoi(str);
-    } catch (const std::exception& e) {
-        return std::nullopt;
-    }
-    return num;
 }
 
 struct NumbersInfo {
@@ -494,6 +530,12 @@ int main(int argc, char *argv[]) {
     for (auto item: items_data) {
         std::string name = item["i18n"][config.ru ? "ru" : "en"]["name"];
         name = tolower_utf(name);
+        if (name.contains("prime") || name.contains("прайм")) {
+            auto words = splitBySpace(name);
+            for (auto &word : words) {
+                possible_words.insert(word);
+            }
+        }
         items_slugs[name] = {
             .slug = item["slug"],
             .vaulted = item["vaulted"].is_boolean() ? (bool)item["vaulted"] : false,
@@ -563,9 +605,10 @@ int main(int argc, char *argv[]) {
 
                             if (l_dist >= config.count_size) {
                                 number = 1;
+                                l_dist = 0;
                             }
 
-                            std::cout << text << " count: " << number << " dist: " << l_dist << std::endl;
+                            std::cout << text << " count: " << number << std::endl;
 
                             continue;
                         }
